@@ -121,6 +121,33 @@ func TestTerminalTitle_RunningStep(t *testing.T) {
 	}
 }
 
+func TestTerminalTitle_CIChecksPassed(t *testing.T) {
+	run := testRunWithCI()
+	run.Steps[5].Status = types.StepStatusRunning
+	m := NewModel("/tmp/sock", nil, run)
+	m.steps = run.Steps
+	m.logs = []string{
+		"monitoring CI for PR #42 (timeout: 4h)...",
+		"all CI checks passed - still monitoring until merged or closed",
+	}
+	title := m.terminalTitle()
+	if title != "✓ Checks passed - feature/foo" {
+		t.Errorf("expected '✓ Checks passed - feature/foo', got %q", title)
+	}
+}
+
+func TestTerminalTitle_CIMonitoringNotReady(t *testing.T) {
+	run := testRunWithCI()
+	run.Steps[5].Status = types.StepStatusRunning
+	m := NewModel("/tmp/sock", nil, run)
+	m.steps = run.Steps
+	m.logs = []string{"monitoring CI for PR #42 (timeout: 4h)..."}
+	title := m.terminalTitle()
+	if strings.Contains(title, "Checks passed") {
+		t.Errorf("expected non-passed CI title while monitoring, got %q", title)
+	}
+}
+
 func TestTerminalTitle_RunningStepSpinnerAdvances(t *testing.T) {
 	run := testRun()
 	run.Steps[0].Status = types.StepStatusRunning

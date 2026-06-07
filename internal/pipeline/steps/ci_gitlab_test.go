@@ -48,7 +48,7 @@ func TestCIStep_GitLabPassesWhenJobsPass(t *testing.T) {
 	}
 	found := false
 	for _, line := range logs {
-		if strings.Contains(line, "all CI checks passed, continuing to monitor") {
+		if strings.Contains(line, "all CI checks passed - still monitoring until merged or closed") {
 			found = true
 			break
 		}
@@ -283,7 +283,7 @@ func TestCIStep_GitLabPendingChecksKeepMonitoringWhenDone(t *testing.T) {
 	}
 	found := false
 	for _, line := range logs {
-		if strings.Contains(line, "all CI checks passed, continuing to monitor") {
+		if strings.Contains(line, "all CI checks passed - still monitoring until merged or closed") {
 			found = true
 			break
 		}

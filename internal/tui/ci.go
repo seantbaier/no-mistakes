@@ -9,6 +9,11 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+const (
+	ciChecksPassedLog   = "all CI checks passed - still monitoring until merged or closed"
+	ciNoChecksPassedLog = "no CI checks reported - still monitoring until merged or closed"
+)
+
 // isCIActive returns true if the CI step is currently running.
 func isCIActive(steps []ipc.StepResultInfo) bool {
 	for _, s := range steps {
@@ -55,31 +60,57 @@ func extractPRFromLogs(logs []string) string {
 type ciActivity struct {
 	CIFixes    int
 	AutoFixing bool
+	Ready      bool
 	LastEvent  string
 }
 
 // parseCIActivity extracts structured activity from CI log messages.
+//
+// Ready reflects the most recent monitoring state: it is true only when the
+// latest relevant log line announced passed checks, and any newer event clears it.
 func parseCIActivity(logs []string) ciActivity {
 	var a ciActivity
 	for _, line := range logs {
 		switch {
-		case strings.Contains(line, "CI failures detected"):
+		case strings.Contains(line, "running agent to fix CI"):
+			// Emitted once per fix attempt by autoFixCI in real runs (and by
+			// demo mode), so it is the reliable signal for counting fixes.
 			a.CIFixes++
 			a.AutoFixing = true
+			a.Ready = false
 			a.LastEvent = line
 		case strings.Contains(line, "committed and pushed fixes"):
 			a.AutoFixing = false
+			a.Ready = false
 			a.LastEvent = line
-		case strings.Contains(line, "running agent to fix CI"):
+		case strings.Contains(line, "CI failures detected"):
 			a.AutoFixing = true
+			a.Ready = false
+			a.LastEvent = line
+		case line == ciChecksPassedLog || line == ciNoChecksPassedLog:
+			a.AutoFixing = false
+			a.Ready = true
+			a.LastEvent = line
+		case strings.Contains(line, "issues detected"),
+			strings.Contains(line, "CI checks running"),
+			strings.Contains(line, "mergeable state still pending"),
+			strings.Contains(line, "warning: could not check CI"),
+			strings.Contains(line, "warning: could not check mergeable state"),
+			strings.Contains(line, "warning: could not check PR state"):
+			a.AutoFixing = false
+			a.Ready = false
 			a.LastEvent = line
 		case strings.Contains(line, "monitoring CI for PR"):
+			a.Ready = false
 			a.LastEvent = line
 		case strings.Contains(line, "PR has been merged"):
+			a.Ready = false
 			a.LastEvent = line
 		case strings.Contains(line, "PR has been closed"):
+			a.Ready = false
 			a.LastEvent = line
 		case strings.Contains(line, "CI timeout"):
+			a.Ready = false
 			a.LastEvent = line
 		}
 	}
@@ -121,6 +152,11 @@ func renderCIViewWithSelection(run *ipc.RunInfo, steps []ipc.StepResultInfo, fin
 		if activity.AutoFixing {
 			style := lipgloss.NewStyle().Foreground(lipgloss.Color(ansiBlue))
 			b.WriteString(style.Render("\u2699 Auto-fixing CI failures...") + "\n")
+		} else if activity.Ready {
+			style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(ansiGreen))
+			b.WriteString(style.Render("✓ Checks passed") + "\n")
+			dim := lipgloss.NewStyle().Foreground(lipgloss.Color(ansiBrightBlack))
+			b.WriteString(dim.Render("still monitoring until merged or closed") + "\n")
 		} else {
 			style := lipgloss.NewStyle().Foreground(lipgloss.Color(ansiGreen))
 			b.WriteString(style.Render("◉ Monitoring CI checks...") + "\n")

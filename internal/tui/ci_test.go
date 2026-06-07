@@ -108,9 +108,12 @@ func TestParseCIActivity(t *testing.T) {
 	})
 
 	t.Run("ci failure detected", func(t *testing.T) {
+		// Mirrors the real CI step log sequence for a failing check that triggers
+		// an auto-fix: the "issues detected" line followed by the agent run.
 		a := parseCIActivity([]string{
 			"monitoring CI for PR #42 (timeout: 4h)...",
-			"CI failures detected: test — auto-fixing...",
+			"issues detected: test - auto-fixing (attempt 1/3)...",
+			"running agent to fix CI issues...",
 		})
 		if a.CIFixes != 1 {
 			t.Errorf("expected 1 CI fix, got %d", a.CIFixes)
@@ -122,8 +125,8 @@ func TestParseCIActivity(t *testing.T) {
 
 	t.Run("ci fix completed", func(t *testing.T) {
 		a := parseCIActivity([]string{
-			"CI failures detected: test — auto-fixing...",
-			"running agent to fix CI failures...",
+			"issues detected: test - auto-fixing (attempt 1/3)...",
+			"running agent to fix CI issues...",
 			"committed and pushed fixes",
 		})
 		if a.CIFixes != 1 {
@@ -136,10 +139,11 @@ func TestParseCIActivity(t *testing.T) {
 
 	t.Run("multiple ci fixes", func(t *testing.T) {
 		a := parseCIActivity([]string{
-			"CI failures detected: test",
+			"issues detected: test - auto-fixing (attempt 1/3)...",
+			"running agent to fix CI issues...",
 			"committed and pushed fixes",
-			"CI failures detected: lint",
-			"running agent to fix CI failures...",
+			"issues detected: lint - auto-fixing (attempt 2/3)...",
+			"running agent to fix CI issues...",
 		})
 		if a.CIFixes != 2 {
 			t.Errorf("expected 2 CI fixes, got %d", a.CIFixes)
@@ -167,6 +171,91 @@ func TestParseCIActivity(t *testing.T) {
 		a := parseCIActivity([]string{"CI timeout reached"})
 		if !strings.Contains(a.LastEvent, "timeout") {
 			t.Error("expected timeout as last event")
+		}
+	})
+
+	t.Run("checks passed when checks pass", func(t *testing.T) {
+		a := parseCIActivity([]string{
+			"monitoring CI for PR #42 (timeout: 4h)...",
+			"all CI checks passed - still monitoring until merged or closed",
+		})
+		if !a.Ready {
+			t.Error("expected Ready to be true after checks pass")
+		}
+	})
+
+	t.Run("checks passed when no checks configured", func(t *testing.T) {
+		a := parseCIActivity([]string{
+			"no CI checks reported - still monitoring until merged or closed",
+		})
+		if !a.Ready {
+			t.Error("expected Ready to be true when no checks are configured")
+		}
+	})
+
+	t.Run("not ready from agent output", func(t *testing.T) {
+		a := parseCIActivity([]string{
+			"CI failures detected: test failed",
+			"agent says this is not ready to merge yet",
+		})
+		if a.Ready {
+			t.Error("expected Ready to ignore non-monitor agent output")
+		}
+	})
+
+	t.Run("ready cleared when checks re-run", func(t *testing.T) {
+		a := parseCIActivity([]string{
+			"all CI checks passed - still monitoring until merged or closed",
+			"CI checks running, waiting for results...",
+		})
+		if a.Ready {
+			t.Error("expected Ready to be cleared once checks start re-running")
+		}
+	})
+
+	t.Run("ready cleared when new failure detected", func(t *testing.T) {
+		a := parseCIActivity([]string{
+			"all CI checks passed - still monitoring until merged or closed",
+			"issues detected: test - auto-fixing (attempt 1/3)...",
+		})
+		if a.Ready {
+			t.Error("expected Ready to be cleared when a new failure appears")
+		}
+	})
+
+	t.Run("ready cleared when mergeability becomes pending", func(t *testing.T) {
+		a := parseCIActivity([]string{
+			"all CI checks passed - still monitoring until merged or closed",
+			"mergeable state still pending: unknown",
+		})
+		if a.Ready {
+			t.Error("expected Ready to be cleared when mergeability is unresolved")
+		}
+	})
+
+	t.Run("ready cleared when polling warning appears", func(t *testing.T) {
+		tests := []string{
+			"warning: could not check CI: rate limited",
+			"warning: could not check mergeable state: rate limited",
+			"warning: could not check PR state: rate limited",
+		}
+		for _, warning := range tests {
+			t.Run(warning, func(t *testing.T) {
+				a := parseCIActivity([]string{
+					"all CI checks passed - still monitoring until merged or closed",
+					warning,
+				})
+				if a.Ready {
+					t.Error("expected Ready to be cleared when polling state is unknown")
+				}
+			})
+		}
+	})
+
+	t.Run("not ready while monitoring", func(t *testing.T) {
+		a := parseCIActivity([]string{"monitoring CI for PR #42 (timeout: 4h)..."})
+		if a.Ready {
+			t.Error("expected Ready to be false before any checks pass")
 		}
 	})
 }
@@ -226,6 +315,42 @@ func TestRenderCIView_AutoFixing(t *testing.T) {
 	}
 	if !strings.Contains(out, "CI auto-fixes: 1") {
 		t.Error("expected CI fix count")
+	}
+}
+
+func TestRenderCIView_ChecksPassed(t *testing.T) {
+	run := testRunWithCI()
+	run.Steps[5].Status = types.StepStatusRunning
+	logs := []string{
+		"monitoring CI for PR #42 (timeout: 4h)...",
+		"all CI checks passed - still monitoring until merged or closed",
+	}
+
+	out := stripANSI(renderCIView(run, run.Steps, "", logs, 80))
+
+	if !strings.Contains(out, "Checks passed") {
+		t.Errorf("expected checks-passed indicator, got: %s", out)
+	}
+	if strings.Contains(out, "Monitoring CI checks...") {
+		t.Errorf("expected ready state to replace the monitoring indicator, got: %s", out)
+	}
+}
+
+func TestRenderCIView_ReadyClearedWhenChecksRerun(t *testing.T) {
+	run := testRunWithCI()
+	run.Steps[5].Status = types.StepStatusRunning
+	logs := []string{
+		"all CI checks passed - still monitoring until merged or closed",
+		"CI checks running, waiting for results...",
+	}
+
+	out := stripANSI(renderCIView(run, run.Steps, "", logs, 80))
+
+	if !strings.Contains(out, "Monitoring CI checks...") {
+		t.Errorf("expected monitoring indicator once checks re-run, got: %s", out)
+	}
+	if strings.Contains(out, "Checks passed") {
+		t.Errorf("expected checks-passed indicator cleared once checks re-run, got: %s", out)
 	}
 }
 
