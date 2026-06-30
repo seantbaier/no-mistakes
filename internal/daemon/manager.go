@@ -124,9 +124,34 @@ func (m *RunManager) closeSubscribers(runID string) {
 	}
 }
 
+// zeroSHA is git's null ref. Used as a base when no prior run anchors one, so
+// the pipeline's base resolution falls back to merge-base/empty-tree.
+const zeroSHA = "0000000000000000000000000000000000000000"
+
+// mergeBaseInGate returns the merge-base of headSHA and the default branch
+// inside the gate bare repo, or "" when it cannot be determined (no default
+// branch, missing ref, or no common ancestor). Best-effort: the caller falls
+// back to the zero SHA and lets the pipeline resolve the base downstream.
+func mergeBaseInGate(ctx context.Context, gateDir, headSHA, defaultBranch string) string {
+	if strings.TrimSpace(defaultBranch) == "" {
+		return ""
+	}
+	mb, err := git.Run(ctx, gateDir, "merge-base", headSHA, "refs/heads/"+defaultBranch)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(mb)
+}
+
 // repoIDFromGatePath extracts the repo ID from a gate bare repo path.
 // Gate paths look like: <root>/repos/<id>.git
 func repoIDFromGatePath(gatePath string) (string, error) {
+	// A relative gate path (notably ".") is the gate-wedge signature: a pre-fix
+	// post-receive hook forwarded $(pwd) as a relative PWD. We cannot map it to
+	// a repo and must not guess, but a clear diagnostic makes it spottable.
+	if gatePath == "" || !filepath.IsAbs(gatePath) {
+		return "", fmt.Errorf("invalid gate path: %q is relative, expected an absolute bare-repo path (stale post-receive hook?)", gatePath)
+	}
 	base := filepath.Base(gatePath)
 	if !strings.HasSuffix(base, ".git") {
 		return "", fmt.Errorf("invalid gate path: %s", gatePath)
@@ -240,8 +265,20 @@ func (m *RunManager) HandleRerun(ctx context.Context, repoID, branch string, ski
 			break
 		}
 	}
+	// No run was ever recorded for this branch, but the gate head ref resolved
+	// above, so the commit IS in the gate. The whole point of a rerun is "the
+	// commit is in the gate, validate it" - erroring here permanently wedges a
+	// branch whose push slipped past run creation (the gate-wedge failure
+	// mode). Self-heal by starting a fresh run, deriving the base from the
+	// merge-base with the default branch (mirroring how a new-branch push lets
+	// the pipeline resolve its base). A zero base is fine: the pipeline's
+	// base resolution falls back to merge-base/empty-tree downstream.
 	if latestForBranch == nil {
-		return "", fmt.Errorf("no previous run for branch %s", branch)
+		baseSHA := zeroSHA
+		if mb := mergeBaseInGate(ctx, gateDir, headSHA, repo.DefaultBranch); mb != "" {
+			baseSHA = mb
+		}
+		return m.startRun(ctx, repo, branch, headSHA, baseSHA, "rerun", skipSteps, intent)
 	}
 
 	baseSHA := latestForBranch.BaseSHA

@@ -208,6 +208,7 @@ func runHappyPath(t *testing.T, agentName string) {
 	assertFailingTestCommandRun(t, h)
 	assertFailingLintCommandRun(t, h)
 	if agentName == "claude" {
+		assertRerunSelfHealsFromGateHead(t, h)
 		assertDifferentBranchDoesNotCancelActiveRun(t, h)
 		assertInvalidConfigPushCleansWorktree(t, h)
 		assertDocumentMissingFindingsRun(t, h)
@@ -784,19 +785,60 @@ func assertRunsEmpty(t *testing.T, h *Harness) {
 
 func assertRerunNoPreviousRun(t *testing.T, h *Harness) {
 	t.Helper()
-	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
-	if out, err := h.runGit(context.Background(), gateDir, "fetch", h.WorkDir, "main:refs/heads/main"); err != nil {
-		t.Fatalf("seed gate main ref before rerun: %v\n%s", err, out)
-	}
+	// Before any push the gate has no ref for the current branch, so rerun
+	// fails cleanly at gate-head resolution. (Once a gate ref exists but no
+	// run was ever recorded, rerun self-heals by starting a fresh run - see
+	// assertRerunSelfHealsFromGateHead.)
 	out, err := h.Run("rerun")
 	if err == nil {
 		t.Fatalf("nm rerun before any push should fail, got output:\n%s", out)
 	}
-	for _, want := range []string{"rerun pipeline", "no previous run"} {
+	for _, want := range []string{"rerun pipeline", "resolve gate head"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rerun error output should contain %q before any push, got:\n%s", want, out)
 		}
 	}
+}
+
+// assertRerunSelfHealsFromGateHead proves the gate-wedge defense-in-depth fix:
+// when a branch's commit is present in the gate but no run was ever recorded
+// (the failure mode where a push slipped past run creation), `nm rerun` must
+// START a fresh run from the gate head instead of wedging with "no previous
+// run for branch". The ref is placed into the gate via fetch (not push), which
+// updates the ref without firing the post-receive hook, so no run pre-exists.
+func assertRerunSelfHealsFromGateHead(t *testing.T, h *Harness) {
+	t.Helper()
+	const branch = "rerun-self-heal"
+	head := h.CommitChange(branch, "self-heal.txt", "self heal\n", "add self-heal change")
+
+	gateDir := filepath.Join(h.NMHome, "repos", h.repoID()+".git")
+	if out, err := h.runGit(context.Background(), gateDir, "fetch", h.WorkDir, branch+":refs/heads/"+branch); err != nil {
+		t.Fatalf("place %s ref into gate without a run: %v\n%s", branch, err, out)
+	}
+
+	for _, run := range h.Runs() {
+		if run.Branch == branch {
+			t.Fatalf("precondition failed: a run already exists for %s", branch)
+		}
+	}
+
+	h.Checkout(branch)
+	out, err := h.Run("rerun")
+	if err != nil {
+		t.Fatalf("nm rerun should self-heal when gate head present but no prior run: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Rerun started") {
+		t.Errorf("rerun output should report a started run, got:\n%s", out)
+	}
+
+	run := h.WaitForRun(branch, 60*time.Second)
+	if run.Status != types.RunCompleted {
+		t.Fatalf("self-healed rerun did not complete: status=%s error=%v", run.Status, deref(run.Error))
+	}
+	if run.HeadSHA != head {
+		t.Errorf("self-healed run head = %q, want gate head %q", run.HeadSHA, head)
+	}
+	h.Checkout("feature/e2e")
 }
 
 func assertRootNoActiveRun(t *testing.T, h *Harness) {

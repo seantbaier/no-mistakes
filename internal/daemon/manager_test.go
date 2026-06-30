@@ -315,6 +315,91 @@ func TestPushReceivedReturnsBeforeIntentSummarization(t *testing.T) {
 	waitForRunTerminalState(t, d, result.RunID)
 }
 
+// TestRepoIDFromGatePath_RelativePathGivesClearError pins the defensive
+// diagnostic for the gate-wedge root cause: a relative/"." gate path (what a
+// pre-fix hook forwarded) must produce a clearly-worded error that names the
+// relative-path problem, never silently guess a repo.
+func TestRepoIDFromGatePath_RelativePathGivesClearError(t *testing.T) {
+	for _, gate := range []string{".", "repos/foo.git", "./foo.git"} {
+		_, err := repoIDFromGatePath(gate)
+		if err == nil {
+			t.Fatalf("repoIDFromGatePath(%q) should error on a relative gate path", gate)
+		}
+		if !strings.Contains(err.Error(), "relative") {
+			t.Fatalf("repoIDFromGatePath(%q) error = %q, want it to mention 'relative'", gate, err)
+		}
+	}
+
+	// An absolute, well-formed gate path still resolves to its repo ID.
+	id, err := repoIDFromGatePath("/nm/repos/myrepo.git")
+	if err != nil {
+		t.Fatalf("absolute gate path should resolve, got: %v", err)
+	}
+	if id != "myrepo" {
+		t.Fatalf("repo ID = %q, want %q", id, "myrepo")
+	}
+}
+
+// TestRerunStartsRunWhenNoPriorRun is the defense-in-depth half of the gate
+// wedge fix: even if a push slips past run creation (e.g. the daemon could not
+// map it to a repo), the ref still lands in the gate, so a subsequent rerun
+// must START a fresh run from the gate head rather than wedging the branch with
+// "no previous run for branch". Here a feature branch exists in the gate with
+// no run ever recorded; HandleRerun must create and complete a run.
+func TestRerunStartsRunWhenNoPriorRun(t *testing.T) {
+	review := &mockPassStep{name: types.StepReview}
+	p, d := startTestDaemonWithSteps(t, func() []pipeline.Step {
+		return []pipeline.Step{review}
+	})
+
+	repo, _ := setupTestGitRepo(t, p, d, "rerun-no-prior-repo")
+
+	// Build a feature branch in the work repo and push it straight to the gate
+	// bare repo, bypassing HandlePushReceived so no run is ever recorded.
+	gitCmd(t, repo.WorkingPath, "checkout", "-b", "feature/x")
+	if err := os.WriteFile(filepath.Join(repo.WorkingPath, "feature.txt"), []byte("feature"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repo.WorkingPath, "add", ".")
+	gitCmd(t, repo.WorkingPath, "commit", "-m", "feature work")
+	gitCmd(t, repo.WorkingPath, "push", "gate", "HEAD:refs/heads/feature/x")
+
+	runs, err := d.GetRunsByRepo("rerun-no-prior-repo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range runs {
+		if run.Branch == "feature/x" {
+			t.Fatalf("precondition failed: a run already exists for feature/x")
+		}
+	}
+
+	client, err := ipc.Dial(p.Socket())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var result ipc.RerunResult
+	if err := client.Call(ipc.MethodRerun, &ipc.RerunParams{
+		RepoID: "rerun-no-prior-repo",
+		Branch: "feature/x",
+	}, &result); err != nil {
+		t.Fatalf("rerun with no prior run should start a fresh run, got: %v", err)
+	}
+	if result.RunID == "" {
+		t.Fatal("expected non-empty run ID from rerun")
+	}
+
+	run := waitForRunTerminalState(t, d, result.RunID)
+	if run.Status != types.RunCompleted {
+		t.Fatalf("run status = %q, want %q", run.Status, types.RunCompleted)
+	}
+	if got := review.execCnt.Load(); got != 1 {
+		t.Fatalf("review executed %d times, want 1", got)
+	}
+}
+
 func writeManagerClaudeFixture(t *testing.T, home, repoCWD string, lines []string) {
 	t.Helper()
 	encoded := testClaudeProjectDirName(repoCWD)

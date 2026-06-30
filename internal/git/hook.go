@@ -35,11 +35,18 @@ NM_BIN=` + shellSingleQuote(command) + `
 if [ ! -f "$NM_BIN" ]; then
   NM_BIN="$(command -v no-mistakes 2>/dev/null || echo no-mistakes)"
 fi
-LOG="$(pwd)/notify-push.log"
+# Derive the gate (bare repo) path from the hook's own location, never $(pwd):
+# git can forward a relative $PWD (e.g. ".") into the hook environment - notably
+# when the push originates from a linked worktree - and the sh pwd builtin
+# echoes it, which would send --gate "." to the daemon and silently drop the
+# push. A post-receive hook lives at <bare>/hooks/post-receive, so <bare> is
+# $0/../.. resolved with a real getcwd (pwd -P).
+GATE_DIR=$(CDPATH= cd -P -- "$(dirname -- "$0")/.." && pwd -P) || GATE_DIR=$(pwd -P)
+LOG="$GATE_DIR/notify-push.log"
 nm_ts() { date '+%Y-%m-%dT%H:%M:%S' 2>/dev/null || echo unknown; }
 notify_failed=0
 while read oldrev newrev refname; do
-	  set -- --gate "$(pwd)" \
+	  set -- --gate "$GATE_DIR" \
 	    --ref "$refname" \
 	    --old "$oldrev" \
 	    --new "$newrev"

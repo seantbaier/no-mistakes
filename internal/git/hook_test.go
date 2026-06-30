@@ -27,8 +27,27 @@ func TestPostReceiveHookScript(t *testing.T) {
 		t.Fatal("hook should read ref update args")
 	}
 
-	if !strings.Contains(script, "--gate \"$(pwd)\"") {
-		t.Fatal("hook should pass the gate path as a flag")
+	// The gate path must be derived from the hook's own location ($0), not
+	// $(pwd): git can forward a relative $PWD (e.g. ".") into the hook env,
+	// and the sh `pwd` builtin would echo it, sending --gate "." to the
+	// daemon, which then cannot map the push to a repo (issue: gate wedge).
+	if strings.Contains(script, "--gate \"$(pwd)\"") {
+		t.Fatal("hook must not pass the gate path as $(pwd); it can be a relative '.'")
+	}
+	if !strings.Contains(script, "GATE_DIR=") {
+		t.Fatal("hook should derive an absolute GATE_DIR from its own location")
+	}
+	if !strings.Contains(script, `dirname -- "$0"`) {
+		t.Fatal("hook should compute GATE_DIR from $0 so it is cwd/PWD-independent")
+	}
+	if !strings.Contains(script, "--gate \"$GATE_DIR\"") {
+		t.Fatal("hook should pass the derived absolute GATE_DIR as the gate flag")
+	}
+	if !strings.Contains(script, `LOG="$GATE_DIR/notify-push.log"`) {
+		t.Fatal("hook should log under the derived absolute GATE_DIR")
+	}
+	if strings.Contains(script, "$(pwd)/notify-push.log") {
+		t.Fatal("hook should not anchor the log to a possibly-relative $(pwd)")
 	}
 	if !strings.Contains(script, "daemon notify-push") {
 		t.Fatal("hook should invoke the CLI notify subcommand")
@@ -157,6 +176,79 @@ func TestPostReceiveHookScriptDoesNotEvaluatePushOptions(t *testing.T) {
 	}
 	if !strings.Contains(string(args), "ok; touch "+markerPath) {
 		t.Fatalf("hook should forward push option literally, got:\n%s", args)
+	}
+}
+
+// TestPostReceiveHook_GatePathIsAbsoluteFromRelativeCwd reproduces the gate
+// wedge: git can invoke the post-receive hook with a relative $PWD (notably
+// when the push originates from a linked worktree), and the old hook passed
+// --gate "$(pwd)", which the sh builtin echoes as ".". The daemon then cannot
+// map "." to a repo and silently creates no run. The fixed hook derives the
+// gate dir from its own location ($0), so the gate flag is always the bare
+// repo's absolute path regardless of cwd or a forwarded relative $PWD.
+func TestPostReceiveHook_GatePathIsAbsoluteFromRelativeCwd(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("post-receive hook is /bin/sh-only")
+	}
+
+	base := t.TempDir()
+	bare := filepath.Join(base, "test.git")
+	hooksDir := filepath.Join(bare, "hooks")
+	if err := os.MkdirAll(hooksDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	argsPath := filepath.Join(base, "args.txt")
+	fakeBin := filepath.Join(base, "fake-no-mistakes")
+	fakeScript := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + shellSingleQuote(argsPath) + "\nexit 0\n"
+	if err := os.WriteFile(fakeBin, []byte(fakeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	hookPath := filepath.Join(hooksDir, "post-receive")
+	if err := os.WriteFile(hookPath, []byte(postReceiveHookScript(fakeBin)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Invoke the hook the way git does (cwd = bare repo) but with a relative
+	// $PWD forwarded into the environment - the condition that triggered the
+	// wedge from a linked worktree.
+	cmd := exec.Command("/bin/sh", hookPath)
+	cmd.Dir = bare
+	cmd.Stdin = strings.NewReader("oldrev newrev refs/heads/main\n")
+	cmd.Env = append(os.Environ(), "PWD=.")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run hook: %v: %s", err, out)
+	}
+
+	raw, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	var gate string
+	for i, tok := range lines {
+		if tok == "--gate" && i+1 < len(lines) {
+			gate = lines[i+1]
+			break
+		}
+	}
+	if gate == "" {
+		t.Fatalf("hook did not pass a --gate argument, got:\n%s", raw)
+	}
+	if gate == "." || !filepath.IsAbs(gate) {
+		t.Fatalf("gate path = %q, want an absolute bare-repo path (not a relative '.')", gate)
+	}
+	wantBare, err := filepath.EvalSymlinks(bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotGate, err := filepath.EvalSymlinks(gate)
+	if err != nil {
+		t.Fatalf("gate path %q does not resolve: %v", gate, err)
+	}
+	if gotGate != wantBare {
+		t.Fatalf("gate path = %q, want %q", gotGate, wantBare)
 	}
 }
 
