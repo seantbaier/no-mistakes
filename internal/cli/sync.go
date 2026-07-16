@@ -19,11 +19,14 @@ func newSyncCmd() *cobra.Command {
 	var check, yes, recover, keepLocal bool
 	cmd := &cobra.Command{
 		Use:   "sync",
-		Short: "Safely fast-forward the current branch to an exact pipeline-pushed head",
+		Short: "Safely move the current branch to an exact pipeline-pushed head",
 		Long: "Refreshes the current branch's persisted pipeline push binding and, after\n" +
-			"confirmation, advances only a completely clean checked-out branch by a strict\n" +
-			"fast-forward. It never resets, stashes, merges divergent work, rebases, switches\n" +
-			"branches, or updates a remote. --check performs the fresh proof without applying it.\n" +
+			"confirmation, advances only a completely clean checked-out branch using one of\n" +
+			"two guarded modes: a strict fast-forward for clean behind branches, or an\n" +
+			"equivalent-diverged advance that first anchors the old head and then moves the\n" +
+			"branch to the verified pipeline head with reset semantics. It never stashes,\n" +
+			"merges genuine divergence, rebases, switches branches, or updates a remote.\n" +
+			"--check performs the fresh proof without applying it.\n" +
 			"--recover returns custody of a branch whose run went terminal with unpublished\n" +
 			"pipeline commits: it anchors the preserved head, fast-forwards a clean behind\n" +
 			"worktree to it, and frees the branch for a fresh run. --recover --keep-local keeps\n" +
@@ -46,7 +49,7 @@ func newSyncCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().BoolVar(&check, "check", false, "freshly verify and show the synchronization plan without changing HEAD")
-	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "apply an eligible strict fast-forward without prompting")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "apply an eligible guarded synchronization without prompting")
 	cmd.Flags().BoolVar(&recover, "recover", false, "return custody of a branch stranded by a terminal run with unpublished pipeline commits")
 	cmd.Flags().BoolVar(&keepLocal, "keep-local", false, "with --recover: keep the current local head; the preserved commits stay anchored and the gate follows the kept head")
 	return cmd
@@ -56,10 +59,13 @@ func newAxiSyncCmd() *cobra.Command {
 	var check, recover, keepLocal bool
 	cmd := &cobra.Command{
 		Use:   "sync",
-		Short: "Check or apply the guarded current-branch fast-forward",
+		Short: "Check or apply guarded current-branch synchronization",
 		Long: "Verifies the registered invoking worktree, clean exact branch, persisted\n" +
 			"pipeline push binding, configured fork or upstream target, live remote equality,\n" +
-			"and strict ancestry. The default applies an eligible fast-forward without a prompt.\n" +
+			"and either strict ancestry or content-equivalent divergence. The default applies\n" +
+			"an eligible plan without a prompt: strict fast-forward for behind branches, or an\n" +
+			"equivalent advance that anchors the old head before moving the branch to the\n" +
+			"verified pipeline head with reset semantics.\n" +
 			"--check performs the same fresh read-only plan. Blocked states change nothing.\n" +
 			"--recover performs the guarded custody return offered by\n" +
 			"next_action.code: recover_custody; --keep-local keeps the current local head.",
@@ -126,7 +132,7 @@ func runHumanSync(cmd *cobra.Command, check, yes bool) error {
 		result = "noop"
 		return nil
 	}
-	if state.Safety != "safe_fast_forward" {
+	if !branchsync.CanApply(state) {
 		result = "refused"
 		return &exitError{code: 1}
 	}
@@ -136,7 +142,11 @@ func runHumanSync(cmd *cobra.Command, check, yes bool) error {
 			result = "refused"
 			return &exitError{code: 1}
 		}
-		fmt.Fprint(cmd.OutOrStdout(), "  Apply this exact strict fast-forward? [y/N] ")
+		if state.Safety == branchsync.SafetySafeEquivalentAdvance {
+			fmt.Fprint(cmd.OutOrStdout(), "  Apply this guarded synchronization? [y/N] ")
+		} else {
+			fmt.Fprint(cmd.OutOrStdout(), "  Apply this exact strict fast-forward? [y/N] ")
+		}
 		line, readErr := bufio.NewReader(cmd.InOrStdin()).ReadString('\n')
 		if readErr != nil && strings.TrimSpace(line) == "" {
 			return readErr
@@ -257,10 +267,18 @@ func humanSyncSummary(state branchsync.State) string {
 	case branchsync.StatePushInProgress:
 		return "pipeline branch update is in progress; synchronization is unavailable"
 	case branchsync.StateBehind:
-		if state.Safety == "safe_fast_forward" {
+		if state.Safety == branchsync.SafetySafeFastForward {
 			return "clean and strictly behind; exact safe fast-forward verified"
 		}
 		return "behind the pipeline-pushed head; refresh required"
+	case branchsync.StateDiverged:
+		if state.Safety == branchsync.SafetySafeEquivalentAdvance {
+			return "diverged, but local changes are represented in the pipeline head; guarded advance verified"
+		}
+		if state.NextAction != nil && state.NextAction.Code == "sync" {
+			return "diverged; refresh required to verify equivalent pipeline content"
+		}
+		return "diverged from the pipeline-pushed head; manual reconciliation required"
 	case branchsync.StateSynchronized:
 		return "already synchronized with the pipeline-pushed head"
 	case branchsync.StateMergedRemoteRemoved:
@@ -376,7 +394,7 @@ func syncStateSuccessful(state branchsync.State, check bool) bool {
 	if state.State == branchsync.StateCustodyReturned {
 		return true
 	}
-	return check && state.Safety == "safe_fast_forward"
+	return check && branchsync.CanApply(state)
 }
 
 func branchSyncField(state branchsync.State) toON.Field {

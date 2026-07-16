@@ -45,7 +45,7 @@ func newSyncFixture(t *testing.T) *syncFixture {
 	old := mustRun(t, local, "rev-parse", "HEAD")
 
 	pipeline := filepath.Join(root, "pipeline")
-	mustRun(t, root, "clone", local, pipeline)
+	mustRun(t, root, "-c", "core.autocrlf=false", "clone", local, pipeline)
 	configureIdentity(t, pipeline)
 	mustRun(t, pipeline, "checkout", "feature/sync")
 	mustWrite(t, filepath.Join(pipeline, "fix.txt"), "pipeline fix\n")
@@ -80,6 +80,73 @@ func newSyncFixture(t *testing.T) *syncFixture {
 	}
 	run, _ = database.GetRun(run.ID)
 	return &syncFixture{t: t, ctx: ctx, db: database, repo: repo, run: run, service: &Service{DB: database, Repo: repo, WorkDir: local}, local: local, remote: remote, base: base, old: old, pushed: pushed}
+}
+
+type pipelineCommit struct {
+	message string
+	files   map[string]string
+}
+
+func newSplitLocalSyncFixture(t *testing.T) *syncFixture {
+	t.Helper()
+	f := newSyncFixture(t)
+	mustWrite(t, filepath.Join(f.local, "second.txt"), "second\n")
+	mustRun(t, f.local, "add", "second.txt")
+	mustRun(t, f.local, "commit", "-m", "second local")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	return f
+}
+
+func rebuildPipelineHead(t *testing.T, f *syncFixture, commits []pipelineCommit) {
+	t.Helper()
+	root := filepath.Dir(f.local)
+	pipeline := filepath.Join(root, "pipeline-rebuild")
+	mustRun(t, root, "-c", "core.autocrlf=false", "clone", f.local, pipeline)
+	configureIdentity(t, pipeline)
+	mustRun(t, pipeline, "checkout", "-B", "feature/sync", f.base)
+	for _, commit := range commits {
+		for name, contents := range commit.files {
+			mustWrite(t, filepath.Join(pipeline, name), contents)
+			mustRun(t, pipeline, "add", name)
+		}
+		mustRun(t, pipeline, "commit", "-m", commit.message)
+	}
+	f.pushed = mustRun(t, pipeline, "rev-parse", "HEAD")
+	mustRun(t, pipeline, "push", "--force", f.remote, "HEAD:refs/heads/feature/sync")
+	if err := f.db.UpdateRunHeadSHA(f.run.ID, f.pushed); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.db.UpdateRunPushBinding(f.run.ID, db.PushBinding{
+		HeadSHA: f.pushed, TargetKind: "upstream", TargetFingerprint: TargetFingerprint(f.remote), Ref: "refs/heads/feature/sync",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	f.run, err = f.db.GetRun(f.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func replaceSyncRun(t *testing.T, f *syncFixture) {
+	t.Helper()
+	run, err := f.db.InsertRun(f.repo.ID, "feature/sync", f.old, f.base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.run = run
+}
+
+func completeSyncRun(t *testing.T, f *syncFixture) {
+	t.Helper()
+	if err := f.db.UpdateRunStatus(f.run.ID, types.RunCompleted); err != nil {
+		t.Fatal(err)
+	}
+	run, err := f.db.GetRun(f.run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.run = run
 }
 
 func TestTargetIdentityNeverPersistsOrDisplaysHTTPUserinfo(t *testing.T) {
@@ -162,6 +229,265 @@ func TestApplyCleanStrictBehindFastForwardsExactBoundHead(t *testing.T) {
 	}
 	if parents := strings.Fields(mustRun(t, f.local, "show", "-s", "--format=%P", "HEAD")); len(parents) != 1 || parents[0] != f.old {
 		t.Fatalf("fast-forward created unexpected history: %v", parents)
+	}
+}
+
+func TestApplyEquivalentButDivergedRebaseWithPipelineCommitsAnchorsAndAdvances(t *testing.T) {
+	f := newSyncFixture(t)
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "feature rebased", files: map[string]string{"file.txt": "feature\n"}},
+		{message: "pipeline doc", files: map[string]string{"doc.txt": "pipeline doc\n"}},
+	})
+
+	state := f.service.Apply(f.ctx)
+	if state.State != StateSynchronized || state.Relation != RelationEqual || state.Safety != "already_synchronized" || !state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.pushed {
+		t.Fatalf("HEAD = %s, want %s", got, f.pushed)
+	}
+	if got := mustRun(t, f.local, "rev-parse", syncAnchorRef(f.run.ID)); got != f.old {
+		t.Fatalf("pre-sync anchor = %s, want %s", got, f.old)
+	}
+	if got := readOptional(t, filepath.Join(f.local, "doc.txt")); got != "pipeline doc\n" {
+		t.Fatalf("pipeline commit not applied: %q", got)
+	}
+}
+
+func TestEquivalentButDivergedClassification(t *testing.T) {
+	tests := []struct {
+		name      string
+		commits   []pipelineCommit
+		wantState string
+		wantSafe  string
+	}{
+		{
+			name: "reordered commits",
+			commits: []pipelineCommit{
+				{message: "second rebased first", files: map[string]string{"second.txt": "second\n"}},
+				{message: "first rebased second", files: map[string]string{"file.txt": "feature\n"}},
+				{message: "pipeline extra", files: map[string]string{"doc.txt": "pipeline doc\n"}},
+			},
+			wantState: StateDiverged,
+			wantSafe:  "safe_equivalent_advance",
+		},
+		{
+			name: "squashed vs split",
+			commits: []pipelineCommit{
+				{message: "feature squashed", files: map[string]string{"file.txt": "feature\n", "second.txt": "second\n"}},
+				{message: "pipeline extra", files: map[string]string{"doc.txt": "pipeline doc\n"}},
+			},
+			wantState: StateDiverged,
+			wantSafe:  "safe_equivalent_advance",
+		},
+		{
+			name: "pipeline extra before equivalent work",
+			commits: []pipelineCommit{
+				{message: "pipeline extra", files: map[string]string{"doc.txt": "pipeline doc\n"}},
+				{message: "second rebased first", files: map[string]string{"second.txt": "second\n"}},
+				{message: "first rebased second", files: map[string]string{"file.txt": "feature\n"}},
+			},
+			wantState: StateDiverged,
+			wantSafe:  "safe_equivalent_advance",
+		},
+		{
+			name: "conflicting rebase output",
+			commits: []pipelineCommit{
+				{message: "feature changed differently", files: map[string]string{"file.txt": "feature but different\n", "second.txt": "second\n"}},
+				{message: "pipeline extra", files: map[string]string{"doc.txt": "pipeline doc\n"}},
+			},
+			wantState: StateDiverged,
+			wantSafe:  "blocked_diverged",
+		},
+		{
+			name: "same path pipeline overwrite after represented work",
+			commits: []pipelineCommit{
+				{message: "feature squashed", files: map[string]string{"file.txt": "feature\n", "second.txt": "second\n"}},
+				{message: "pipeline overwrite", files: map[string]string{"file.txt": "pipeline overwrite\n"}},
+			},
+			wantState: StateDiverged,
+			wantSafe:  "blocked_diverged",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSplitLocalSyncFixture(t)
+			rebuildPipelineHead(t, f, tc.commits)
+
+			state := f.service.Refresh(f.ctx)
+			if state.State != tc.wantState || state.Relation != RelationDiverged || state.Safety != tc.wantSafe || state.Changed {
+				t.Fatalf("state = %#v", state)
+			}
+		})
+	}
+}
+
+func TestEquivalentDivergenceAcceptsSamePathPipelineFix(t *testing.T) {
+	f := newSyncFixture(t)
+	mustWrite(t, filepath.Join(f.local, "file.txt"), "base\nstable\n")
+	mustRun(t, f.local, "commit", "-am", "expand base file")
+	f.base = mustRun(t, f.local, "rev-parse", "HEAD")
+	mustWrite(t, filepath.Join(f.local, "file.txt"), "feature\nstable\n")
+	mustRun(t, f.local, "commit", "-am", "local feature")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	replaceSyncRun(t, f)
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "feature squashed", files: map[string]string{"file.txt": "feature\nstable\n"}},
+		{message: "pipeline same path fix", files: map[string]string{"file.txt": "feature\nstable\npipeline fix\n"}},
+	})
+	completeSyncRun(t, f)
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "safe_equivalent_advance" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceRefusesRenameSourceOmission(t *testing.T) {
+	f := newSyncFixture(t)
+	mustRun(t, f.local, "config", "diff.renames", "true")
+	mustRun(t, f.local, "mv", "file.txt", "renamed.txt")
+	mustRun(t, f.local, "commit", "-m", "rename feature file")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "feature copied", files: map[string]string{"file.txt": "feature\n", "renamed.txt": "feature\n"}},
+	})
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "blocked_diverged" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceRefusesDifferentBinaryContent(t *testing.T) {
+	f := newSyncFixture(t)
+	mustWrite(t, filepath.Join(f.local, "blob.bin"), string([]byte{0x00, 0x01, 0x02, 0x03}))
+	mustRun(t, f.local, "add", "blob.bin")
+	mustRun(t, f.local, "commit", "-m", "local binary")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "feature rebased", files: map[string]string{"file.txt": "feature\n"}},
+		{message: "binary changed differently", files: map[string]string{"blob.bin": string([]byte{0x00, 0x01, 0x02, 0x04})}},
+	})
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "blocked_diverged" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceRefusesIntermediatePatchReverted(t *testing.T) {
+	f := newSyncFixture(t)
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "feature rebased", files: map[string]string{"file.txt": "feature\n"}},
+		{message: "pipeline reverts feature", files: map[string]string{"file.txt": "base\n"}},
+		{message: "pipeline extra", files: map[string]string{"extra.txt": "extra\n"}},
+	})
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "blocked_diverged" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceRefusesWrongRepeatedLineOccurrence(t *testing.T) {
+	f := newSyncFixture(t)
+	mustWrite(t, filepath.Join(f.local, "repeated.txt"), "foo\nfoo\n")
+	mustRun(t, f.local, "add", "repeated.txt")
+	mustRun(t, f.local, "commit", "-m", "add repeated lines")
+	f.base = mustRun(t, f.local, "rev-parse", "HEAD")
+	mustWrite(t, filepath.Join(f.local, "repeated.txt"), "bar\nfoo\n")
+	mustRun(t, f.local, "commit", "-am", "change first occurrence")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "change second occurrence", files: map[string]string{"repeated.txt": "foo\nbar\n"}},
+	})
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "blocked_diverged" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceAcceptsShiftedPreservedHunk(t *testing.T) {
+	f := newSyncFixture(t)
+	mustWrite(t, filepath.Join(f.local, "file.txt"), "alpha\nbase\nomega\n")
+	mustRun(t, f.local, "commit", "-am", "expand base file")
+	f.base = mustRun(t, f.local, "rev-parse", "HEAD")
+	mustWrite(t, filepath.Join(f.local, "file.txt"), "alpha\nfeature\nomega\n")
+	mustRun(t, f.local, "commit", "-am", "local feature")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	replaceSyncRun(t, f)
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "feature squashed", files: map[string]string{"file.txt": "alpha\nfeature\nomega\n"}},
+		{message: "pipeline inserts earlier line", files: map[string]string{"file.txt": "inserted\nalpha\nfeature\nomega\n"}},
+	})
+	completeSyncRun(t, f)
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "safe_equivalent_advance" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceRefusesAmbiguousRepeatedContext(t *testing.T) {
+	f := newSyncFixture(t)
+	mustWrite(t, filepath.Join(f.local, "file.txt"), "ctx\nfeature\nend\n")
+	mustRun(t, f.local, "commit", "-am", "contextual feature")
+	f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+	rebuildPipelineHead(t, f, []pipelineCommit{
+		{message: "duplicate contextual feature", files: map[string]string{"file.txt": "ctx\nfeature\nend\nctx\nfeature\nend\n"}},
+	})
+
+	state := f.service.Refresh(f.ctx)
+	if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "blocked_diverged" || state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+}
+
+func TestEquivalentDivergenceRefusesUnrepresentedEdgeDeletion(t *testing.T) {
+	cases := map[string]struct {
+		base     string
+		local    string
+		pipeline string
+	}{
+		"start":              {base: "delete\nkeep\n", local: "keep\n", pipeline: "delete\nkeep\npipeline\n"},
+		"end":                {base: "keep\ndelete\n", local: "keep\n", pipeline: "pipeline\nkeep\ndelete\n"},
+		"intervening insert": {base: "delete\nkeep\n", local: "keep\n", pipeline: "delete\ninserted\nkeep\n"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newSyncFixture(t)
+			mustWrite(t, filepath.Join(f.local, "edge.txt"), tc.base)
+			mustRun(t, f.local, "add", "edge.txt")
+			mustRun(t, f.local, "commit", "-m", "add edge file")
+			f.base = mustRun(t, f.local, "rev-parse", "HEAD")
+			mustWrite(t, filepath.Join(f.local, "edge.txt"), tc.local)
+			mustRun(t, f.local, "commit", "-am", "delete edge line")
+			f.old = mustRun(t, f.local, "rev-parse", "HEAD")
+			replaceSyncRun(t, f)
+			rebuildPipelineHead(t, f, []pipelineCommit{
+				{message: "pipeline leaves deletion unrepresented", files: map[string]string{"edge.txt": tc.pipeline}},
+				{message: "pipeline extra", files: map[string]string{"extra.txt": "extra\n"}},
+			})
+			completeSyncRun(t, f)
+
+			state := f.service.Refresh(f.ctx)
+			if state.State != StateDiverged || state.Relation != RelationDiverged || state.Safety != "blocked_diverged" || state.Changed {
+				t.Fatalf("state = %#v", state)
+			}
+		})
+	}
+}
+
+func TestApplyEmptyLocalUniquenessStillUsesStrictBehindFastForward(t *testing.T) {
+	f := newSyncFixture(t)
+	state := f.service.Apply(f.ctx)
+	if state.State != StateSynchronized || !state.Changed {
+		t.Fatalf("state = %#v", state)
+	}
+	if _, err := gitpkg.Run(f.ctx, f.local, "rev-parse", "--verify", "--quiet", syncAnchorRef(f.run.ID)); err == nil {
+		t.Fatal("strict behind fast-forward should not create an equivalent-divergence anchor")
 	}
 }
 
@@ -442,7 +768,7 @@ func TestForkTargetNeverReadsParentOrigin(t *testing.T) {
 func cloneRemoteBranch(t *testing.T, remote string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "writer")
-	mustRun(t, filepath.Dir(dir), "clone", remote, dir)
+	mustRun(t, filepath.Dir(dir), "-c", "core.autocrlf=false", "clone", remote, dir)
 	configureIdentity(t, dir)
 	mustRun(t, dir, "checkout", "feature/sync")
 	return dir
@@ -450,6 +776,7 @@ func cloneRemoteBranch(t *testing.T, remote string) string {
 
 func configureIdentity(t *testing.T, dir string) {
 	t.Helper()
+	mustRun(t, dir, "config", "core.autocrlf", "false")
 	mustRun(t, dir, "config", "user.email", "test@example.com")
 	mustRun(t, dir, "config", "user.name", "Test User")
 }
